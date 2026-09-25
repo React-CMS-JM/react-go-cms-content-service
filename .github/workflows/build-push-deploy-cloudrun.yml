@@ -1,0 +1,116 @@
+name: Build Push Deploy Cloud Run
+
+# Build the Go image, push it to Artifact Registry, and deploy Cloud Run.
+# Production only, matching the frontend Worker (main).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CLOUD_RUN_SERVICE: cr-react-cms-content
+  IMAGE_NAME: react-go-cms-content-service
+  HEALTH_PATH: /api/content/health
+
+jobs:
+  build-push-deploy:
+    name: Build Go image and deploy to Cloud Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Resolve GCP settings
+        id: gcp
+        run: |
+          PROJECT_ID="${{ vars.GCP_PROJECT_ID }}"
+          REGION="${{ vars.GCP_REGION }}"
+          AR_REPO="${{ vars.AR_REPOSITORY }}"
+          RUN_SA="${{ vars.GCP_CLOUD_RUN_SERVICE_ACCOUNT }}"
+          if [ -z "$PROJECT_ID" ] || [ -z "$REGION" ] || [ -z "$AR_REPO" ] || [ -z "$RUN_SA" ]; then
+            echo "Set repository Variables: GCP_PROJECT_ID, GCP_REGION, AR_REPOSITORY, GCP_CLOUD_RUN_SERVICE_ACCOUNT" >&2
+            exit 1
+          fi
+          IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/${{ env.IMAGE_NAME }}"
+          echo "project_id=${PROJECT_ID}" >> "$GITHUB_OUTPUT"
+          echo "region=${REGION}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "run_sa=${RUN_SA}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve app env
+        id: app_env
+        env:
+          DB_USER: ${{ vars.DB_USER }}
+          DB_HOST: ${{ vars.DB_HOST }}
+          DB_PORT: ${{ vars.DB_PORT }}
+          DB_NAME: ${{ vars.DB_NAME }}
+          DB_SSL_MODE: ${{ vars.DB_SSL_MODE }}
+          JWT_ISSUER: ${{ vars.JWT_ISSUER }}
+          JWT_LIFESPAN: ${{ vars.JWT_LIFESPAN }}
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+          AUTH_SERVICE_URL: ${{ vars.AUTH_SERVICE_URL }}
+        run: |
+          for name in DB_USER DB_HOST DB_PORT DB_NAME DB_SSL_MODE JWT_ISSUER JWT_LIFESPAN CORS_ORIGINS AUTH_SERVICE_URL; do
+            if [ -z "${!name}" ]; then
+              echo "Set repository Variable ${name}" >&2
+              exit 1
+            fi
+          done
+          delimiter='^|^'
+          echo "env_vars=${delimiter}DB_USER=${DB_USER}|DB_HOST=${DB_HOST}|DB_PORT=${DB_PORT}|DB_NAME=${DB_NAME}|DB_SSL_MODE=${DB_SSL_MODE}|JWT_ISSUER=${JWT_ISSUER}|JWT_LIFESPAN=${JWT_LIFESPAN}|CORS_ORIGINS=${CORS_ORIGINS}|AUTH_SERVICE_URL=${AUTH_SERVICE_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ steps.gcp.outputs.region }}-docker.pkg.dev" --quiet
+
+      - name: Extract Docker metadata (tags and labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.gcp.outputs.image_uri }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.CLOUD_RUN_SERVICE }}
+          region: ${{ steps.gcp.outputs.region }}
+          project_id: ${{ steps.gcp.outputs.project_id }}
+          image: ${{ steps.gcp.outputs.image_uri }}:${{ github.sha }}
+          flags: >-
+            --allow-unauthenticated
+            --port=8080
+            --memory=256Mi
+            --cpu=1
+            --cpu-boost
+            --min-instances=0
+            --max-instances=3
+            --timeout=300
+            --service-account=${{ steps.gcp.outputs.run_sa }}
+            --set-secrets=DB_PASSWORD=react-cms-db-password:latest,JWT_SECRET=react-cms-jwt-secret:latest
+            --set-env-vars=${{ steps.app_env.outputs.env_vars }}
+            --startup-probe=httpGet.path=${{ env.HEALTH_PATH }},httpGet.port=8080,initialDelaySeconds=0,periodSeconds=2,failureThreshold=60,timeoutSeconds=1
+            --liveness-probe=httpGet.path=${{ env.HEALTH_PATH }},httpGet.port=8080,periodSeconds=30,timeoutSeconds=3
