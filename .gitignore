@@ -1,0 +1,23 @@
+# IntelliJ
+.idea
+*.ipr
+*.iml
+*.iws
+
+# Junie
+.junie
+
+# Build output
+/bin/
+*.exe
+
+# Local environment
+.env
+*.env
+!.env.example
+
+# Logs
+*.log
+
+# OS
+.DS_Store
